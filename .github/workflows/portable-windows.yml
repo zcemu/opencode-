@@ -1,11 +1,11 @@
 
-name: Build OpenCode Portable Windows
+name: OpenCode Portable Windows
 
 on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: "Source branch or commit to build"
+        description: "Official source branch or commit"
         required: true
         default: "dev"
         type: string
@@ -14,7 +14,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: portable-windows-build
+  group: opencode-portable-windows
   cancel-in-progress: false
 
 jobs:
@@ -36,42 +36,60 @@ jobs:
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.4
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Build Desktop
+      - name: Build and package Desktop
         working-directory: packages/desktop
-        run: bun run build
-
-      - name: Package unpacked Windows app
-        working-directory: packages/desktop
-        run: bunx electron-builder --win --x64 --dir --publish never --config electron-builder.config.ts
-
-      - name: Create portable ZIP
         shell: pwsh
         run: |
-          $source = "packages/desktop/dist/win-unpacked"
-          $output = "release"
-          $zip = "$output/OpenCode-Portable-Windows-x64.zip"
-
-          if (!(Test-Path "$source/resources/app.asar")) {
-            throw "Desktop build output not found or incomplete: $source"
+          bun run build
+          if ($LASTEXITCODE -ne 0) {
+            throw "Desktop build failed"
           }
 
-          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          bun run pack
+          if ($LASTEXITCODE -ne 0) {
+            throw "Desktop packaging failed"
+          }
+
+      - name: Prepare portable ZIP
+        shell: pwsh
+        run: |
+          $appDir = "dist/desktop/app"
+          $releaseDir = "release"
+          $zipPath = "$releaseDir/OpenCode-Portable-Windows-x64.zip"
+
+          if (!(Test-Path $appDir)) {
+            throw "Portable application directory not found: $appDir"
+          }
+
+          $exe = Get-ChildItem $appDir -Filter "*.exe" -File -Recurse |
+            Select-Object -First 1
+
+          if (!$exe) {
+            throw "No executable found in portable application directory"
+          }
+
+          New-Item -ItemType Directory -Force -Path $releaseDir |
+            Out-Null
 
           Compress-Archive `
-            -Path "$source/*" `
-            -DestinationPath $zip `
+            -Path "$appDir/*" `
+            -DestinationPath $zipPath `
             -CompressionLevel Optimal
 
-          Write-Host "Portable package created: $zip"
-          Get-ChildItem $output
+          if (!(Test-Path $zipPath)) {
+            throw "ZIP creation failed"
+          }
 
-      - name: Upload build artifact
+          $size = (Get-Item $zipPath).Length / 1MB
+
+          Write-Host "Executable: $($exe.FullName)"
+          Write-Host "ZIP size: $([math]::Round($size, 2)) MB"
+
+      - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
           name: OpenCode-Portable-Windows-x64
@@ -79,19 +97,42 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Publish latest portable release
+        id: publish
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: portable-build-${{ github.run_number }}
-          name: OpenCode Portable Windows Build ${{ github.run_number }}
+          tag_name: portable-latest
+          target_commitish: ${{ github.sha }}
+          name: OpenCode Portable Windows (Latest)
           body: |
-            Self-built OpenCode Desktop for Windows x64.
+            Self-built OpenCode Desktop Portable for Windows x64.
 
-            Source: ${{ inputs.source_ref }}
-            Commit: ${{ github.sha }}
+            Source branch: ${{ inputs.source_ref }}
+            Source commit: ${{ github.sha }}
 
-            Unpacked application packaged as ZIP.
+            Download the ZIP, extract it and run OpenCode.exe.
+
+            This release is automatically updated by GitHub Actions.
           files: release/OpenCode-Portable-Windows-x64.zip
+          overwrite_files: true
           fail_on_unmatched_files: true
-          prerelease: true
-          make_latest: false
+          prerelease: false
+          make_latest: true
+
+      - name: Write download links
+        shell: pwsh
+        run: |
+          $repo = "${{ github.repository }}"
+          $download = "https://github.com/$repo/releases/latest/download/OpenCode-Portable-Windows-x64.zip"
+          $release = "https://github.com/$repo/releases/tag/portable-latest"
+
+          @"
+          ## OpenCode Portable Windows
+
+          <a href="$download">Download latest Windows x64 Portable ZIP</a>
+
+          **Source:** `${{ inputs.source_ref }}`
+          **Commit:** `${{ github.sha }}`
+
+          [View Release]($release)
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
