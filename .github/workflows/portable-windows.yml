@@ -1,262 +1,90 @@
 
-name: Build OpenCode Desktop Portable Windows
-
-on:
-  workflow_dispatch:
-    inputs:
-      source_ref:
-        description: "Source branch or tag to build"
-        required: true
-        default: "dev"
-        type: string
-
-permissions:
-  contents: write
-
-concurrency:
-  group: opencode-portable-windows
-  cancel-in-progress: true
-
-jobs:
-  build:
-    name: Build Windows x64 Portable
-    runs-on: windows-latest
-    timeout-minutes: 60
-
-    env:
-      OPENCODE_CHANNEL: dev
-      OPENCODE_TARGET: windows-x64
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.source_ref }}
-          fetch-depth: 1
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Install dependencies
-        shell: pwsh
-        run: |
-          bun install --frozen-lockfile
-          if ($LASTEXITCODE -ne 0) {
-            throw "Dependency installation failed."
-          }
-
-      # Patch the actual upstream Electron startup code.
-      # Packaged app data will be stored beside the executable.
-      - name: Apply portable mode
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          # Normalize line endings before applying source patches.
-          $configure = "packages/desktop/src/main/lifecycle/configure.ts"
-          $source = [IO.File]::ReadAllText($configure).Replace("`r`n", "`n")
-
-          # Match the current upstream userData initialization block.
-          $pattern = '(?ms)^  const testRoot = createTestRoot\(\)\n.*?^  // Reads the settings store, so it runs once userData is set\.\n'
-          $regex = [regex]::new($pattern)
-
-          if ($regex.Matches($source).Count -ne 1) {
-            throw "Could not uniquely locate the Electron userData section in configure.ts."
-          }
-
-          $replacement = @'
-          const testRoot = createTestRoot()
-          const portableRoot = app.isPackaged && !testRoot ? path.dirname(process.execPath) : undefined
-
-          if (portableRoot) {
-            const portableData = path.join(portableRoot, "DATA")
-            const dirs = {
-              config: path.join(portableData, "config"),
-              data: path.join(portableData, "data"),
-              cache: path.join(portableData, "cache"),
-              state: path.join(portableData, "state"),
-              desktop: path.join(portableData, "desktop"),
-              session: path.join(portableData, "session"),
-              appData: path.join(portableData, "appdata"),
-              roaming: path.join(portableData, "roaming"),
-              local: path.join(portableData, "local"),
-              temp: path.join(portableData, "temp"),
-            }
-
-            for (const dir of Object.values(dirs)) {
-              mkdirSync(dir, { recursive: true })
-            }
-
-            Object.assign(process.env, {
-              OPENCODE_PORTABLE_HOME: portableData,
-              OPENCODE_DISABLE_AUTOUPDATE: "true",
-              XDG_CONFIG_HOME: dirs.config,
-              XDG_DATA_HOME: dirs.data,
-              XDG_CACHE_HOME: dirs.cache,
-              XDG_STATE_HOME: dirs.state,
-              APPDATA: dirs.roaming,
-              LOCALAPPDATA: dirs.local,
-              TEMP: dirs.temp,
-              TMP: dirs.temp,
-            })
-
-            app.setPath("appData", dirs.appData)
-            app.setPath("userData", dirs.desktop)
-            app.setPath("sessionData", dirs.session)
-            app.setPath("temp", dirs.temp)
-          } else {
-            const customUserData = debugBuild(build) && !testRoot ? process.env.OPENCODE_DESKTOP_USER_DATA : undefined
-            app.setPath(
-              "userData",
-              customUserData ?? (testRoot ? path.join(testRoot, "desktop") : path.join(app.getPath("appData"), APP_ID)),
-            )
-
-            if (customUserData) {
-              app.setPath("sessionData", path.join(customUserData, "session"))
-            }
-          }
-
-          // Reads the settings store, so it runs once userData is set.
-          '@
-
-          $source = $regex.Replace(
-            $source,
-            [System.Text.RegularExpressions.MatchEvaluator]{
-              param($match)
-              return $replacement
-            },
-            1
-          )
-
-          [IO.File]::WriteAllText(
-            $configure,
-            $source,
-            [System.Text.UTF8Encoding]::new($false)
-          )
-
-          # Preserve XDG_STATE_HOME in the Windows packaged application.
-          $environment = "packages/desktop/src/main/lifecycle/environment.ts"
-          $envSource = [IO.File]::ReadAllText($environment).Replace("`r`n", "`n")
-
-          $envPattern = '(?m)^(\s*)if \(!shellEnv\?\.XDG_STATE_HOME\) delete process\.env\.XDG_STATE_HOME$'
-          $envRegex = [regex]::new($envPattern)
-
-          if ($envRegex.Matches($envSource).Count -ne 1) {
-            throw "Could not locate the XDG_STATE_HOME cleanup statement in environment.ts."
-          }
-
-          $envSource = $envRegex.Replace(
-            $envSource,
-            [System.Text.RegularExpressions.MatchEvaluator]{
-              param($match)
-              return $match.Groups[1].Value + 'if (!shellEnv?.XDG_STATE_HOME && !process.env.OPENCODE_PORTABLE_HOME) delete process.env.XDG_STATE_HOME'
-            },
-            1
-          )
-
-          [IO.File]::WriteAllText(
-            $environment,
-            $envSource,
-            [System.Text.UTF8Encoding]::new($false)
-          )
-
-          Write-Host "Portable mode patches applied successfully."
-
-      - name: Build Desktop
-        shell: pwsh
-        working-directory: packages/desktop
-        run: |
-          bun run build
-          if ($LASTEXITCODE -ne 0) {
-            throw "Desktop build failed."
-          }
-
-          bun run pack
-          if ($LASTEXITCODE -ne 0) {
-            throw "Desktop packaging failed."
-          }
-
       - name: Assemble portable ZIP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $appDir = "dist/desktop/app"
+          $appDir = Join-Path $env:GITHUB_WORKSPACE "dist/desktop/app"
 
-          if (-not (Test-Path "$appDir/OpenCode.exe")) {
-            throw "OpenCode.exe was not found in $appDir. The desktop packaging output may have changed."
+          # Verify the actual output directory.
+          if (-not (Test-Path -LiteralPath $appDir -PathType Container)) {
+            Write-Host "Desktop output directory was not found."
+            Write-Host "Available desktop output:"
+            if (Test-Path "dist/desktop") {
+              Get-ChildItem "dist/desktop" -Force -Recurse |
+                Select-Object -First 80 FullName
+            }
+            throw "Expected unpacked application directory: $appDir"
           }
 
-          # Prevent the packaged app from finding the official update feed.
-          $updateConfig = "$appDir/resources/app-update.yml"
-          if (Test-Path $updateConfig) {
-            Remove-Item $updateConfig -Force
+          # Find the actual Electron application executable.
+          # Do not assume it is named OpenCode.exe.
+          $executables = @(
+            Get-ChildItem -LiteralPath $appDir -File -Filter "*.exe" |
+              Where-Object {
+                $_.Name -notmatch '^(opencode-cli|uninstall|elevate)\.exe$'
+              }
+          )
+
+          if ($executables.Count -ne 1) {
+            Write-Host "Executable candidates found:"
+            $executables | ForEach-Object {
+              Write-Host $_.FullName
+            }
+
+            Write-Host "All EXE files under the application directory:"
+            Get-ChildItem -LiteralPath $appDir -Recurse -File -Filter "*.exe" |
+              ForEach-Object {
+                Write-Host $_.FullName
+              }
+
+            throw "Expected exactly one main application EXE in $appDir, found $($executables.Count)."
           }
 
-          # Portable data directory.
-          New-Item -ItemType Directory -Force -Path "$appDir/DATA" | Out-Null
+          $mainExe = $executables[0]
+          Write-Host "Main application executable: $($mainExe.Name)"
 
-          # Optional runtime directory for user-supplied tools.
-          New-Item -ItemType Directory -Force -Path "$appDir/BIN" | Out-Null
+          # Remove the updater feed configuration.
+          $updateConfig = Join-Path $appDir "resources/app-update.yml"
 
-          # Keep empty directories in the ZIP.
-          Set-Content -Path "$appDir/DATA/.keep" -Value "Portable application data" -Encoding utf8
-          Set-Content -Path "$appDir/BIN/.keep" -Value "Optional portable tools" -Encoding utf8
-
-          $zipPath = "dist/OpenCode-Portable-Windows-x64.zip"
-
-          if (Test-Path $zipPath) {
-            Remove-Item $zipPath -Force
+          if (Test-Path -LiteralPath $updateConfig) {
+            Remove-Item -LiteralPath $updateConfig -Force
+            Write-Host "Removed app-update.yml."
           }
 
-          Compress-Archive -Path "$appDir/*" -DestinationPath $zipPath -CompressionLevel Optimal
+          # Create portable data and optional tools directories.
+          $dataDir = Join-Path $appDir "DATA"
+          $binDir = Join-Path $appDir "BIN"
 
-          if (-not (Test-Path $zipPath)) {
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+
+          Set-Content -Path (Join-Path $dataDir ".keep") `
+            -Value "Portable application data" -Encoding utf8
+
+          Set-Content -Path (Join-Path $binDir ".keep") `
+            -Value "Optional portable tools" -Encoding utf8
+
+          # Create ZIP.
+          $zipDir = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $zipPath = Join-Path $zipDir "OpenCode-Portable-Windows-x64.zip"
+
+          if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force
+          }
+
+          Compress-Archive `
+            -Path (Join-Path $appDir "*") `
+            -DestinationPath $zipPath `
+            -CompressionLevel Optimal
+
+          if (-not (Test-Path -LiteralPath $zipPath)) {
             throw "Portable ZIP creation failed."
           }
 
-          $zip = Get-Item $zipPath
-          Write-Host "Portable ZIP created: $($zip.FullName)"
-          Write-Host "ZIP size: $([math]::Round($zip.Length / 1MB, 2)) MB"
+          $zip = Get-Item -LiteralPath $zipPath
 
-      - name: Publish or update portable Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: portable-latest
-          target_commitish: ${{ github.sha }}
-          name: OpenCode Desktop Portable - Windows x64
-          body: |
-            OpenCode Desktop Windows x64 portable build.
-
-            - Extract the ZIP and run OpenCode.exe.
-            - Application data is stored in the DATA directory.
-            - BIN is reserved for optional portable tools.
-            - This build does not use the official installer.
-            - Automatic update feed configuration has been removed.
-
-            Source ref: ${{ inputs.source_ref }}
-            Commit: ${{ github.sha }}
-          files: dist/OpenCode-Portable-Windows-x64.zip
-          overwrite_files: true
-          draft: false
-          prerelease: true
-          make_latest: false
-
-      - name: Build summary
-        shell: pwsh
-        run: |
-          $download = "https://github.com/${{ github.repository }}/releases/download/portable-latest/OpenCode-Portable-Windows-x64.zip"
-
-          @"
-          ## OpenCode Desktop Portable Build
-
-          **Build:** Successful
-
-          **Source:** `${{ inputs.source_ref }}`
-
-          **Commit:** `${{ github.sha }}`
-
-          **Download:**
-
-          $download
-          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          Write-Host "Portable ZIP created successfully."
+          Write-Host "Application EXE: $($mainExe.Name)"
+          Write-Host "ZIP: $($zip.FullName)"
+          Write-Host "Size: $([math]::Round($zip.Length / 1MB, 2)) MB"
