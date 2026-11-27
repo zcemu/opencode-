@@ -1,0 +1,97 @@
+
+name: Build OpenCode Portable Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Source branch or commit to build"
+        required: true
+        default: "dev"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: portable-windows-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Windows x64 Portable
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    env:
+      OPENCODE_CHANNEL: dev
+      OPENCODE_TARGET: windows-x64
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build Desktop
+        working-directory: packages/desktop
+        run: bun run build
+
+      - name: Package unpacked Windows app
+        working-directory: packages/desktop
+        run: bunx electron-builder --win --x64 --dir --publish never --config electron-builder.config.ts
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          $source = "packages/desktop/dist/win-unpacked"
+          $output = "release"
+          $zip = "$output/OpenCode-Portable-Windows-x64.zip"
+
+          if (!(Test-Path "$source/resources/app.asar")) {
+            throw "Desktop build output not found or incomplete: $source"
+          }
+
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+
+          Compress-Archive `
+            -Path "$source/*" `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal
+
+          Write-Host "Portable package created: $zip"
+          Get-ChildItem $output
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenCode-Portable-Windows-x64
+          path: release/OpenCode-Portable-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: portable-build-${{ github.run_number }}
+          name: OpenCode Portable Windows Build ${{ github.run_number }}
+          body: |
+            Self-built OpenCode Desktop for Windows x64.
+
+            Source: ${{ inputs.source_ref }}
+            Commit: ${{ github.sha }}
+
+            Unpacked application packaged as ZIP.
+          files: release/OpenCode-Portable-Windows-x64.zip
+          fail_on_unmatched_files: true
+          prerelease: true
+          make_latest: false
