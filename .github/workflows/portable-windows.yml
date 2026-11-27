@@ -26,69 +26,228 @@ jobs:
     env:
       OPENCODE_CHANNEL: dev
       OPENCODE_TARGET: windows-x64
+      OPENCODE_PORTABLE_BUILD: "1"
 
     steps:
+      # 1. 获取指定版本源码
       - name: Checkout source
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 1
 
+      - name: Record source commit
+        id: source
+        shell: pwsh
+        run: |
+          $commit = git rev-parse HEAD
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          Write-Host "Building source: $commit"
+
+      # 2. 安装 Bun
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
+      # 3. 安装项目依赖
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Build and package Desktop
-        working-directory: packages/desktop
+      # 4. 修改 Electron 数据目录，实现真正的便携模式
+      - name: Apply portable mode
         shell: pwsh
         run: |
-          bun run build
-          if ($LASTEXITCODE -ne 0) {
-            throw "Desktop build failed"
+          $configure = "packages/desktop/src/main/lifecycle/configure.ts"
+          $source = [IO.File]::ReadAllText($configure).Replace("`r`n", "`n")
+
+          $oldBlock = @'
+            const testRoot = createTestRoot()
+            const customUserData = debugBuild(build) && !testRoot ? process.env.OPENCODE_DESKTOP_USER_DATA : undefined
+            app.setPath(
+              "userData",
+              customUserData ?? (testRoot ? path.join(testRoot, "desktop") : path.join(app.getPath("appData"), APP_ID)),
+            )
+
+            if (customUserData) {
+              app.setPath("sessionData", path.join(customUserData, "session"))
+            }
+          '@
+
+          $newBlock = @'
+            // Portable mode: store all application data beside the executable.
+            const portableRoot = path.dirname(process.execPath)
+            const portableData = path.join(portableRoot, "DATA")
+
+            const portableDirs = {
+              config: path.join(portableData, "config"),
+              data: path.join(portableData, "data"),
+              cache: path.join(portableData, "cache"),
+              state: path.join(portableData, "state"),
+              desktop: path.join(portableData, "desktop"),
+              appData: path.join(portableData, "appdata"),
+              roaming: path.join(portableData, "roaming"),
+              local: path.join(portableData, "local"),
+              temp: path.join(portableData, "temp"),
+            }
+
+            mkdirSync(path.join(portableRoot, "BIN"), { recursive: true })
+
+            for (const dir of Object.values(portableDirs)) {
+              mkdirSync(dir, { recursive: true })
+            }
+
+            process.env.OPENCODE_PORTABLE_HOME = portableData
+            process.env.XDG_CONFIG_HOME = portableDirs.config
+            process.env.XDG_DATA_HOME = portableDirs.data
+            process.env.XDG_CACHE_HOME = portableDirs.cache
+            process.env.XDG_STATE_HOME = portableDirs.state
+            process.env.APPDATA = portableDirs.roaming
+            process.env.LOCALAPPDATA = portableDirs.local
+            process.env.TEMP = portableDirs.temp
+            process.env.TMP = portableDirs.temp
+
+            const testRoot = createTestRoot()
+
+            app.setPath("appData", portableDirs.appData)
+            app.setPath(
+              "userData",
+              testRoot ? path.join(testRoot, "desktop") : portableDirs.desktop,
+            )
+            app.setPath(
+              "sessionData",
+              testRoot ? path.join(testRoot, "session") : path.join(portableDirs.desktop, "session"),
+            )
+          '@
+
+          if (!$source.Contains($oldBlock)) {
+            throw "Could not locate the expected Electron userData block. Source may have changed."
           }
+
+          $source = $source.Replace($oldBlock, $newBlock)
+          [IO.File]::WriteAllText(
+            $configure,
+            $source,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          # Preserve the portable XDG_STATE_HOME when Desktop prepares its environment.
+          $environment = "packages/desktop/src/main/lifecycle/environment.ts"
+          $envSource = [IO.File]::ReadAllText($environment).Replace("`r`n", "`n")
+
+          $oldEnv = '    if (!shellEnv?.XDG_STATE_HOME) delete process.env.XDG_STATE_HOME'
+          $newEnv = '    if (!shellEnv?.XDG_STATE_HOME && !process.env.OPENCODE_PORTABLE_HOME) delete process.env.XDG_STATE_HOME'
+
+          if (!$envSource.Contains($oldEnv)) {
+            throw "Could not locate XDG_STATE_HOME environment handling."
+          }
+
+          $envSource = $envSource.Replace($oldEnv, $newEnv)
+
+          [IO.File]::WriteAllText(
+            $environment,
+            $envSource,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          Write-Host "Portable source modifications applied."
+
+      # 5. 构建桌面应用
+      - name: Build Desktop
+        working-directory: packages/desktop
+        run: |
+          bun run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           bun run pack
-          if ($LASTEXITCODE -ne 0) {
-            throw "Desktop packaging failed"
-          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Prepare portable ZIP
+      # 6. 创建便携版目录和 ZIP
+      - name: Prepare portable package
         shell: pwsh
         run: |
           $appDir = "dist/desktop/app"
           $releaseDir = "release"
-          $zipPath = "$releaseDir/OpenCode-Portable-Windows-x64.zip"
+          $stage = "$releaseDir/OpenCode-Portable-Windows-x64"
+          $zip = "$releaseDir/OpenCode-Portable-Windows-x64.zip"
 
           if (!(Test-Path $appDir)) {
-            throw "Portable application directory not found: $appDir"
+            throw "Official desktop output not found: $appDir"
           }
 
-          $exe = Get-ChildItem $appDir -Filter "*.exe" -File -Recurse |
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          Get-ChildItem -LiteralPath $appDir -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $stage -Recurse -Force
+          }
+
+          $exe = Get-ChildItem -Path $stage -Filter "*.exe" -File |
             Select-Object -First 1
 
           if (!$exe) {
-            throw "No executable found in portable application directory"
+            throw "Desktop executable not found in package root."
           }
 
-          New-Item -ItemType Directory -Force -Path $releaseDir |
-            Out-Null
+          # DATA: 配置、会话、缓存和桌面状态
+          $dataDirs = @(
+            "config", "data", "cache", "state",
+            "desktop", "appdata", "roaming", "local", "temp"
+          )
+
+          foreach ($dir in $dataDirs) {
+            $path = Join-Path "$stage/DATA" $dir
+            New-Item -ItemType Directory -Force -Path $path | Out-Null
+          }
+
+          # BIN: 可选的便携工具目录，不强制依赖系统 Git / Node
+          $binDirs = @(
+            "git/cmd", "git/bin", "node"
+          )
+
+          foreach ($dir in $binDirs) {
+            $path = Join-Path "$stage/BIN" $dir
+            New-Item -ItemType Directory -Force -Path $path | Out-Null
+          }
+
+          @"
+          OpenCode Portable Windows x64
+
+          Run: $($exe.Name)
+
+          DATA:
+          Stores configuration, sessions, cache and desktop state.
+
+          BIN:
+          Optional portable Git and Node.js tools.
+          The application includes its own bundled CLI.
+
+          This package does not use the official installer.
+          Updates are distributed through the portable ZIP release.
+          "@ | Set-Content "$stage/PORTABLE-README.txt" -Encoding utf8
+
+          # 删除官方更新源配置，避免便携版跟随官方安装更新
+          $updateConfig = Join-Path $stage "resources/app-update.yml"
+
+          if (Test-Path $updateConfig) {
+            Remove-Item $updateConfig -Force
+          }
+
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
 
           Compress-Archive `
-            -Path "$appDir/*" `
-            -DestinationPath $zipPath `
+            -Path "$stage/*" `
+            -DestinationPath $zip `
             -CompressionLevel Optimal
 
-          if (!(Test-Path $zipPath)) {
-            throw "ZIP creation failed"
+          if (!(Test-Path $zip)) {
+            throw "Portable ZIP creation failed."
           }
 
-          $size = (Get-Item $zipPath).Length / 1MB
+          Write-Host "Executable: $($exe.Name)"
+          Write-Host "Package: $zip"
+          Write-Host "Size: $([math]::Round((Get-Item $zip).Length / 1MB, 2)) MB"
 
-          Write-Host "Executable: $($exe.FullName)"
-          Write-Host "ZIP size: $([math]::Round($size, 2)) MB"
-
+      # 7. 上传 Actions 临时构建产物
       - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
@@ -97,29 +256,31 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # 8. 更新固定 Release 下载入口
       - name: Publish latest portable release
-        id: publish
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: portable-latest
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ steps.source.outputs.commit }}
           name: OpenCode Portable Windows (Latest)
           body: |
-            Self-built OpenCode Desktop Portable for Windows x64.
+            OpenCode Desktop Portable - Windows x64
 
             Source branch: ${{ inputs.source_ref }}
-            Source commit: ${{ github.sha }}
+            Source commit: ${{ steps.source.outputs.commit }}
 
-            Download the ZIP, extract it and run OpenCode.exe.
+            Extract the ZIP and run the executable.
+            DATA and BIN are stored beside the application.
 
-            This release is automatically updated by GitHub Actions.
+            This is a self-built portable package.
           files: release/OpenCode-Portable-Windows-x64.zip
           overwrite_files: true
           fail_on_unmatched_files: true
           prerelease: false
           make_latest: true
 
-      - name: Write download links
+      # 9. Actions 页面显示直接下载入口
+      - name: Publish download links
         shell: pwsh
         run: |
           $repo = "${{ github.repository }}"
@@ -127,12 +288,11 @@ jobs:
           $release = "https://github.com/$repo/releases/tag/portable-latest"
 
           @"
-          ## OpenCode Portable Windows
+          ## OpenCode Portable Windows x64
 
-          <a href="$download">Download latest Windows x64 Portable ZIP</a>
+          ### [Download Latest Portable ZIP]($download)
 
-          **Source:** `${{ inputs.source_ref }}`
-          **Commit:** `${{ github.sha }}`
+          [Open Release Page]($release)
 
-          [View Release]($release)
-          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Source commit: `${{ steps.source.outputs.commit }}`
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
